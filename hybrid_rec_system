@@ -1,0 +1,201 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+import pandas as pd
+import numpy as np
+import math
+
+from scipy.sparse import coo_matrix
+from implicit.als import AlternatingLeastSquares
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+
+
+print("Loading data...")
+
+train = pd.read_parquet("processed/train.parquet")
+val   = pd.read_parquet("processed/val.parquet")
+test  = pd.read_parquet("processed/test.parquet")
+
+print("Loaded:")
+print(train.shape, val.shape, test.shape)
+
+
+
+user_enc = LabelEncoder()
+item_enc = LabelEncoder()
+
+user_enc.fit(train["user_id"])
+item_enc.fit(train["parent_asin"])
+
+# Filter train
+train = train[
+    train["user_id"].isin(user_enc.classes_) &
+    train["parent_asin"].isin(item_enc.classes_)
+].copy()
+
+train["user_idx"] = user_enc.transform(train["user_id"])
+train["item_idx"] = item_enc.transform(train["parent_asin"])
+
+# Lookup map
+item2idx = {item: idx for idx, item in enumerate(item_enc.classes_)}
+idx2item = {idx: item for item, idx in item2idx.items()}
+
+num_users = train["user_idx"].nunique()
+num_items = train["item_idx"].nunique()
+
+print(f"Users: {num_users} | Items: {num_items}")
+
+
+# ALS MATRIX
+print("Building ALS matrix...")
+
+matrix = coo_matrix(
+    (np.ones(len(train)), (train["user_idx"], train["item_idx"]))
+).tocsr()
+
+
+# IF-IDF
+print("Building TF-IDF model...")
+
+# Ensure text exists
+if "text" not in train.columns:
+    train["text"] = ""
+
+train["text"] = train["text"].fillna("").astype(str)
+
+# Aggregate text per item
+item_text = train.groupby("item_idx")["text"].apply(
+    lambda x: " ".join(x)
+)
+
+# Handle empty case
+if item_text.str.strip().eq("").all():
+    print("⚠️ WARNING: No text data — using dummy TF-IDF")
+    item_text = pd.Series(["dummy"] * len(item_text), index=item_text.index)
+
+tfidf = TfidfVectorizer(max_features=3000, stop_words="english")
+item_vecs = tfidf.fit_transform(item_text)
+
+
+# TRAINING ALS
+def train_als(factors=64, reg=0.05):
+    model = AlternatingLeastSquares(
+        factors=factors,
+        regularization=reg,
+        iterations=20
+    )
+    model.fit(matrix)
+    return model
+
+# HYBRID RECOMMENDER
+def recommend(history, model, alpha=0.7, k=10):
+
+    items = history.split()
+
+
+    item_idxs = [
+        item2idx[i]
+        for i in items
+        if i in item2idx
+    ]
+
+    if len(item_idxs) == 0:
+        return []
+
+    # ALS CANDIDATES
+    user_vec = model.item_factors[item_idxs].mean(axis=0)
+    scores = model.item_factors @ user_vec
+
+    # remove seen
+    scores[item_idxs] = -np.inf
+
+    # top 200 candidates
+    candidate_idx = np.argsort(-scores)[:200]
+
+    #CONTENT RERANK 
+    user_profile = item_vecs[item_idxs].mean(axis=0)
+
+    content_scores = (
+        item_vecs[candidate_idx] @ user_profile.T
+    ).A.ravel()
+
+    als_scores = scores[candidate_idx]
+
+    hybrid = alpha * als_scores + (1 - alpha) * content_scores
+
+    top_k_idx = candidate_idx[np.argsort(-hybrid)[:k]]
+    return [idx2item[i] for i in top_k_idx]
+
+
+# NDCG@10
+def ndcg_at_k(df, model, alpha=0.7, k=10):
+
+    total = 0
+    score = 0.0
+
+    for _, row in df.iterrows():
+
+        recs = recommend(row["history"], model, alpha, k)
+        target = row["target"]
+
+        if target in recs:
+            rank = recs.index(target)
+            score += 1.0 / math.log2(rank + 2)
+
+        total += 1
+
+    return score / total if total > 0 else 0
+
+
+# HYPERPARAMETER TUNING
+print("\nTuning hyperparameters...\n")
+
+best_score = -1
+best_params = None
+best_model = None
+
+
+val_sample = val.sample(3000, random_state=42)
+
+for alpha in [0.5, 0.7,]:
+    for factors in [32, 64, 128]:
+        for reg in [0.01, 0.05, 0.1]:
+
+            model = train_als(factors, reg)
+
+            score = ndcg_at_k(val_sample, model, alpha)
+
+            print(f"alpha={alpha}, f={factors}, reg={reg} → {score:.4f}")
+
+            if score > best_score:
+                best_score = score
+                best_params = (alpha, factors, reg)
+                best_model = model
+
+print("\nBEST PARAMS:", best_params)
+print("BEST VAL NDCG@10:", best_score)
+
+
+# FINAL MODEL AFTER TUNING PARAMETERS
+alpha, factors, reg = best_params
+
+print("\nTraining final model...")
+
+final_model = train_als(factors, reg)
+
+# FINAL TEST
+print("\nEvaluating on TEST...\n")
+
+test_sample = test.sample(3000, random_state=42)
+
+test_score = ndcg_at_k(test_sample, final_model, alpha)
+
+print(f"FINAL TEST NDCG@10: {test_score:.4f}")
+
+
+# SAMPLE RECOMMENDATION
+sample_history = test.iloc[0]["history"]
+
+print("\nSample recommendations:")
+print(recommend(sample_history, final_model, alpha))
